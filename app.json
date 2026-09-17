@@ -1,8 +1,9 @@
 {
   "expo": {
-    "name": "openadmin-mobile",
+    "name": "OpenAdmin",
     "slug": "openadmin-mobile",
     "version": "1.0.0",
+    "description": "Manage your OpenAdmin servers on the go.",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -10,8 +11,10 @@
       "supportsTablet": true
     },
     "android": {
+      "package": "com.openpanel.openadmin",
+      "usesCleartextTraffic": true,
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#FFFFFF",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
@@ -20,6 +23,16 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      "expo-secure-store",
+      "./plugins/withReleaseSigning.js"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "abcb9248-940c-4253-9cdd-450a54d3eadb"
+      }
+    },
+    "owner": "stefanpejcic"
   }
 }
