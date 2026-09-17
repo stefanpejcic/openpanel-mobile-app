@@ -1,18 +1,25 @@
+cat release-apk.yml 
 name: Build & release Android APK
 
-# Runs whenever a GitHub Release is published (the APK gets attached to that
-# release automatically), or manually via workflow_dispatch for an on-demand
-# build you can download from the run's Artifacts tab without cutting a release.
+# Runs manually via workflow_dispatch (an on-demand build), or whenever a
+# GitHub Release is published (the APK gets attached to that release too).
+# Every run also cuts its own auto-versioned, auto-tagged GitHub Release --
+# no need to create a release by hand first.
 on:
   release:
     types: [published]
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -48,6 +55,26 @@ jobs:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "${{ runner.temp }}/release.keystore"
 
+      # versionCode must strictly increase for Android to treat a new APK as
+      # an update rather than a conflicting reinstall -- github.run_number
+      # already does that (unique, increasing, per workflow). versionName is
+      # just the display string; app.json's committed "version" is kept as
+      # the human-chosen base (bump it by hand for a real marketing version).
+      - name: Compute version and tag
+        id: version
+        run: |
+          BASE_VERSION=$(node -p "require('./app.json').expo.version")
+          VERSION_NAME="${BASE_VERSION}-${{ github.run_number }}"
+          node -e "
+            const fs = require('fs');
+            const app = JSON.parse(fs.readFileSync('app.json', 'utf8'));
+            app.expo.version = '${VERSION_NAME}';
+            app.expo.android = app.expo.android || {};
+            app.expo.android.versionCode = ${{ github.run_number }};
+            fs.writeFileSync('app.json', JSON.stringify(app, null, 2) + '\n');
+          "
+          echo "tag=v${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+
       - name: Prebuild native android project
         run: npx expo prebuild -p android
 
@@ -64,15 +91,28 @@ jobs:
           ./gradlew assembleRelease --no-daemon
 
       - name: Rename APK
-        run: cp android/app/build/outputs/apk/release/app-release.apk OpenAdmin.apk
+        run: cp android/app/build/outputs/apk/release/app-release.apk OpenPanel.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: OpenAdmin.apk
-          path: OpenAdmin.apk
+          name: OpenPanel.apk
+          path: OpenPanel.apk
 
-      - name: Attach APK to the GitHub Release
+      # Only for a workflow_dispatch (or any trigger other than an existing
+      # release) -- a run triggered by a release publish attaches to that
+      # release instead (below), it doesn't also cut a second one.
+      - name: Create a tagged GitHub Release for this build
+        if: github.event_name != 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" OpenPanel.apk \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes
+
+      - name: Attach APK to the release that triggered this run
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.event.release.tag_name }}" OpenAdmin.apk --clobber --repo "${{ github.repository }}"
+        run: gh release upload "${{ github.event.release.tag_name }}" OpenPanel.apk --clobber --repo "${{ github.repository }}"
