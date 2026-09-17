@@ -49,6 +49,23 @@ async function saveServers(servers: ServerMeta[]) {
   await SecureStore.setItemAsync(SERVERS_KEY, JSON.stringify(servers));
 }
 
+type ServerStatus = 'checking' | 'online' | 'offline';
+
+// GET /api/ is OpenAdmin's unauthenticated health check -- cheap way to know
+// if a server is reachable before the user taps in to actually log in.
+async function checkServerStatus(server: ServerMeta): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const res = await fetch(`${server.baseUrl}/api/`, { method: 'GET', signal: controller.signal });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 type Screen =
   | { name: 'list' }
   | { name: 'add' }
@@ -57,11 +74,28 @@ type Screen =
 
 export default function App() {
   const [servers, setServers] = useState<ServerMeta[]>([]);
+  const [statuses, setStatuses] = useState<Record<string, ServerStatus>>({});
   const [screen, setScreen] = useState<Screen>({ name: 'list' });
 
-  useEffect(() => {
-    loadServers().then(setServers);
+  const refreshStatuses = useCallback((list: ServerMeta[]) => {
+    setStatuses((prev) => {
+      const next = { ...prev };
+      list.forEach((s) => (next[s.id] = 'checking'));
+      return next;
+    });
+    list.forEach((server) => {
+      checkServerStatus(server).then((ok) => {
+        setStatuses((prev) => ({ ...prev, [server.id]: ok ? 'online' : 'offline' }));
+      });
+    });
   }, []);
+
+  useEffect(() => {
+    loadServers().then((list) => {
+      setServers(list);
+      refreshStatuses(list);
+    });
+  }, [refreshStatuses]);
 
   const handleAddServer = useCallback(
     async (name: string, baseUrl: string, username: string, password: string) => {
@@ -72,6 +106,7 @@ export default function App() {
       await SecureStore.setItemAsync(pwKey(id), password);
       setServers(next);
       setScreen({ name: 'list' });
+      refreshStatuses([entry]);
     },
     [servers]
   );
@@ -123,7 +158,13 @@ export default function App() {
     content = (
       <SafeAreaView style={styles.webviewSafeArea} edges={['top', 'bottom', 'left', 'right']}>
         <View style={styles.webviewHeader}>
-          <TouchableOpacity onPress={() => setScreen({ name: 'list' })} style={styles.webviewCloseBtn}>
+          <TouchableOpacity
+            onPress={() => {
+              setScreen({ name: 'list' });
+              refreshStatuses(servers);
+            }}
+            style={styles.webviewCloseBtn}
+          >
             <Text style={styles.webviewCloseText}>‹ Servers</Text>
           </TouchableOpacity>
           <Text style={styles.webviewTitle} numberOfLines={1}>
@@ -148,6 +189,7 @@ export default function App() {
     content = (
       <ServerListScreen
         servers={servers}
+        statuses={statuses}
         onConnect={handleConnect}
         onDelete={handleDeleteServer}
         onAdd={() => setScreen({ name: 'add' })}
@@ -158,13 +200,21 @@ export default function App() {
   return <SafeAreaProvider>{content}</SafeAreaProvider>;
 }
 
+function StatusDot({ status }: { status: ServerStatus | undefined }) {
+  const color =
+    status === 'online' ? '#2ecc71' : status === 'offline' ? '#e74c3c' : '#ccc';
+  return <View style={[styles.statusDot, { backgroundColor: color }]} />;
+}
+
 function ServerListScreen({
   servers,
+  statuses,
   onConnect,
   onDelete,
   onAdd,
 }: {
   servers: ServerMeta[];
+  statuses: Record<string, ServerStatus>;
   onConnect: (s: ServerMeta) => void;
   onDelete: (id: string) => void;
   onAdd: () => void;
@@ -185,6 +235,7 @@ function ServerListScreen({
         }
         renderItem={({ item }) => (
           <TouchableOpacity style={styles.serverRow} onPress={() => onConnect(item)}>
+            <StatusDot status={statuses[item.id]} />
             <View style={{ flex: 1 }}>
               <Text style={styles.serverName}>{item.name}</Text>
               <Text style={styles.serverSub}>
@@ -315,6 +366,7 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: '#ddd',
   },
+  statusDot: { width: 9, height: 9, borderRadius: 5, marginRight: 12 },
   serverName: { fontSize: 17, fontWeight: '600' },
   serverSub: { fontSize: 13, color: '#777', marginTop: 2 },
   deleteText: { color: '#c0392b', fontSize: 13 },
