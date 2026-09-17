@@ -1,4 +1,3 @@
-cat release-apk.yml 
 name: Build & release Android APK
 
 # Runs manually via workflow_dispatch (an on-demand build), or whenever a
