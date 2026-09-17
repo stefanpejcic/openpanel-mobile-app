@@ -1,9 +1,9 @@
 {
   "expo": {
-    "name": "OpenAdmin",
+    "name": "OpenPanel",
     "slug": "openadmin-mobile",
     "version": "1.0.0",
-    "description": "Manage your OpenAdmin servers on the go.",
+    "description": "Manage your OpenPanel accounts and OpenAdmin servers on the go.",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",

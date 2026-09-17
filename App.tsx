@@ -18,11 +18,14 @@ import { WebView } from 'react-native-webview';
 
 const logoMark = require('./assets/logo-mark.png');
 
+type PanelType = 'openpanel' | 'openadmin';
+
 type ServerMeta = {
   id: string;
   name: string;
   baseUrl: string;
   username: string;
+  panel: PanelType;
 };
 
 const SERVERS_KEY = 'oa_servers_meta';
@@ -39,7 +42,9 @@ async function loadServers(): Promise<ServerMeta[]> {
   const raw = await SecureStore.getItemAsync(SERVERS_KEY);
   if (!raw) return [];
   try {
-    return JSON.parse(raw) as ServerMeta[];
+    const list = JSON.parse(raw) as ServerMeta[];
+    // servers saved before panel-type support default to openadmin (the only type back then)
+    return list.map((s) => ({ ...s, panel: s.panel ?? 'openadmin' }));
   } catch {
     return [];
   }
@@ -51,18 +56,55 @@ async function saveServers(servers: ServerMeta[]) {
 
 type ServerStatus = 'checking' | 'online' | 'offline';
 
-// GET /api/ is OpenAdmin's unauthenticated health check -- cheap way to know
-// if a server is reachable before the user taps in to actually log in.
+// GET /login is an unauthenticated page on both OpenPanel and OpenAdmin --
+// cheap way to know a server is reachable before the user taps in to log in.
 async function checkServerStatus(server: ServerMeta): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000);
   try {
-    const res = await fetch(`${server.baseUrl}/api/`, { method: 'GET', signal: controller.signal });
+    const res = await fetch(`${server.baseUrl}/login`, { method: 'GET', signal: controller.signal });
     return res.ok;
   } catch {
     return false;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+// OpenPanel has no SSO handoff like OpenAdmin's, so adding one is validated
+// upfront instead: log in for a real API token, then probe a feature-gated
+// endpoint, since login itself succeeds even when API access is disabled.
+async function testOpenPanelConnection(baseUrl: string, username: string, password: string): Promise<void> {
+  const loginRes = await fetch(`${baseUrl}/api/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const loginBody = await loginRes.json().catch(() => ({}));
+  if (!loginRes.ok) {
+    if (loginBody?.twofa_required) {
+      throw new Error("This account has 2FA enabled, which isn't supported here yet. Disable 2FA to add it for now.");
+    }
+    throw new Error(loginBody?.error || `Login failed (HTTP ${loginRes.status})`);
+  }
+  const token = loginBody?.token;
+  if (!token) throw new Error('OpenPanel did not return an API token.');
+
+  const checkRes = await fetch(`${baseUrl}/api/sites`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (checkRes.status === 403) {
+    const checkBody = await checkRes.json().catch(() => ({}));
+    if ((checkBody?.hint || '').toLowerCase().includes('api access')) {
+      throw new Error(
+        "API access is not enabled for this account. Check Account > API Reference in your OpenPanel account " +
+          "— if it's not there, contact your hosting provider to enable API access."
+      );
+    }
+    throw new Error(checkBody?.error || 'Access denied.');
+  }
+  if (!checkRes.ok) {
+    throw new Error(`Could not verify API access (HTTP ${checkRes.status}).`);
   }
 }
 
@@ -98,9 +140,13 @@ export default function App() {
   }, [refreshStatuses]);
 
   const handleAddServer = useCallback(
-    async (name: string, baseUrl: string, username: string, password: string) => {
+    async (name: string, rawBaseUrl: string, username: string, password: string, panel: PanelType) => {
+      const baseUrl = normalizeBaseUrl(rawBaseUrl);
+      if (panel === 'openpanel') {
+        await testOpenPanelConnection(baseUrl, username, password);
+      }
       const id = `${Date.now()}`;
-      const entry: ServerMeta = { id, name, baseUrl: normalizeBaseUrl(baseUrl), username };
+      const entry: ServerMeta = { id, name, baseUrl, username, panel };
       const next = [...servers, entry];
       await saveServers(next);
       await SecureStore.setItemAsync(pwKey(id), password);
@@ -122,6 +168,12 @@ export default function App() {
   );
 
   const handleConnect = useCallback(async (server: ServerMeta) => {
+    if (server.panel === 'openpanel') {
+      // No SSO handoff on OpenPanel yet -- open its normal login page and let
+      // the user sign in there, same as they would in a regular browser.
+      setScreen({ name: 'webview', server, url: `${server.baseUrl}/login` });
+      return;
+    }
     setScreen({ name: 'connecting', server });
     try {
       const password = await SecureStore.getItemAsync(pwKey(server.id));
@@ -224,7 +276,7 @@ function ServerListScreen({
       <StatusBar barStyle="dark-content" />
       <View style={styles.headerRow}>
         <Image source={logoMark} style={styles.headerLogo} resizeMode="contain" />
-        <Text style={styles.header}>OpenAdmin</Text>
+        <Text style={styles.header}>OpenPanel</Text>
       </View>
       <FlatList
         data={servers}
@@ -240,6 +292,9 @@ function ServerListScreen({
               <Text style={styles.serverName}>{item.name}</Text>
               <Text style={styles.serverSub}>
                 {item.username}@{item.baseUrl.replace(/^https?:\/\//, '')}
+              </Text>
+              <Text style={styles.serverPanelLabel}>
+                {item.panel === 'openpanel' ? 'OpenPanel account' : 'OpenAdmin server'}
               </Text>
             </View>
             <TouchableOpacity
@@ -263,12 +318,44 @@ function ServerListScreen({
   );
 }
 
+function PanelTypeOption({
+  label,
+  selected,
+  accentColor,
+  onPress,
+}: {
+  label: string;
+  selected: boolean;
+  accentColor: string;
+  onPress: () => void;
+}) {
+  return (
+    <TouchableOpacity
+      style={[styles.panelOption, selected && { borderColor: accentColor }]}
+      onPress={onPress}
+    >
+      <Image
+        source={logoMark}
+        style={[styles.panelOptionLogo, { tintColor: accentColor }]}
+        resizeMode="contain"
+      />
+      <Text style={[styles.panelOptionLabel, selected && { color: accentColor }]}>{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
 function AddServerScreen({
   onCancel,
   onSave,
 }: {
   onCancel: () => void;
-  onSave: (name: string, baseUrl: string, username: string, password: string) => Promise<void>;
+  onSave: (
+    name: string,
+    baseUrl: string,
+    username: string,
+    password: string,
+    panel: PanelType
+  ) => Promise<void>;
 }) {
   const [name, setName] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
@@ -276,6 +363,21 @@ function AddServerScreen({
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [panel, setPanel] = useState<PanelType>('openpanel');
+  const [panelTouched, setPanelTouched] = useState(false);
+
+  // Auto-pick the panel type from the port the user typed (2083 -> OpenPanel,
+  // 2087 -> OpenAdmin's default), unless they've already picked one themselves.
+  useEffect(() => {
+    if (panelTouched) return;
+    if (/:2087\b/.test(baseUrl)) setPanel('openadmin');
+    else if (/:2083\b/.test(baseUrl)) setPanel('openpanel');
+  }, [baseUrl, panelTouched]);
+
+  const selectPanel = (p: PanelType) => {
+    setPanel(p);
+    setPanelTouched(true);
+  };
 
   const canSave = name.trim() && baseUrl.trim() && username.trim() && password.length > 0 && !saving;
 
@@ -283,6 +385,22 @@ function AddServerScreen({
     <SafeAreaView style={styles.screen}>
       <Text style={styles.header}>Add server</Text>
       <View style={styles.form}>
+        <Text style={styles.label}>Type</Text>
+        <View style={styles.panelPickerRow}>
+          <PanelTypeOption
+            label="OpenPanel"
+            accentColor="#2e7dd7"
+            selected={panel === 'openpanel'}
+            onPress={() => selectPanel('openpanel')}
+          />
+          <PanelTypeOption
+            label="OpenAdmin"
+            accentColor="#111"
+            selected={panel === 'openadmin'}
+            onPress={() => selectPanel('openadmin')}
+          />
+        </View>
+
         <Text style={styles.label}>Name</Text>
         <TextInput
           style={styles.input}
@@ -297,7 +415,7 @@ function AddServerScreen({
           style={styles.input}
           value={baseUrl}
           onChangeText={setBaseUrl}
-          placeholder="panel.example.com or https://1.2.3.4:2087"
+          placeholder="panel.example.com:2083 (OpenPanel) or :2087 (OpenAdmin)"
           placeholderTextColor="#999"
           autoCapitalize="none"
           autoCorrect={false}
@@ -337,11 +455,18 @@ function AddServerScreen({
           disabled={!canSave}
           onPress={async () => {
             setSaving(true);
-            await onSave(name.trim(), baseUrl, username.trim(), password);
-            setSaving(false);
+            try {
+              await onSave(name.trim(), baseUrl, username.trim(), password, panel);
+            } catch (err: any) {
+              Alert.alert('Could not add server', err?.message || String(err));
+            } finally {
+              setSaving(false);
+            }
           }}
         >
-          <Text style={styles.primaryButtonText}>{saving ? 'Saving…' : 'Save'}</Text>
+          <Text style={styles.primaryButtonText}>
+            {saving ? (panel === 'openpanel' ? 'Testing connection…' : 'Saving…') : 'Save'}
+          </Text>
         </TouchableOpacity>
         <TouchableOpacity style={styles.secondaryButton} onPress={onCancel}>
           <Text style={styles.secondaryButtonText}>Cancel</Text>
@@ -369,6 +494,7 @@ const styles = StyleSheet.create({
   statusDot: { width: 9, height: 9, borderRadius: 5, marginRight: 12 },
   serverName: { fontSize: 17, fontWeight: '600' },
   serverSub: { fontSize: 13, color: '#777', marginTop: 2 },
+  serverPanelLabel: { fontSize: 11, color: '#aaa', marginTop: 2 },
   deleteText: { color: '#c0392b', fontSize: 13 },
   primaryButton: {
     backgroundColor: '#111',
@@ -383,6 +509,17 @@ const styles = StyleSheet.create({
   secondaryButton: { alignItems: 'center', paddingVertical: 12 },
   secondaryButtonText: { color: '#555', fontSize: 15 },
   form: { marginTop: 8 },
+  panelPickerRow: { flexDirection: 'row', gap: 10 },
+  panelOption: {
+    flex: 1,
+    alignItems: 'center',
+    borderWidth: 2,
+    borderColor: '#ddd',
+    borderRadius: 10,
+    paddingVertical: 14,
+  },
+  panelOptionLogo: { width: 28, height: 28, marginBottom: 6 },
+  panelOptionLabel: { fontSize: 14, fontWeight: '600', color: '#555' },
   label: { fontSize: 13, color: '#555', marginTop: 14, marginBottom: 6 },
   input: {
     borderWidth: StyleSheet.hairlineWidth,
