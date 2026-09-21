@@ -183,11 +183,19 @@ export default function App() {
         body: JSON.stringify({ username: server.username, password }),
       });
       const body = await res.json().catch(() => ({}));
-      if (!res.ok) {
+      if (res.status === 401 || res.status === 403) {
+        // A genuine credential/account problem -- surface it instead of silently falling back.
         throw new Error(body?.error || `Login failed (HTTP ${res.status})`);
       }
-      const loginPath = body?.login_path;
-      if (!loginPath) throw new Error('Server did not return a login link.');
+      const loginPath = res.ok ? body?.login_path : undefined;
+      if (!loginPath) {
+        // Quick-login isn't available -- most likely an OpenAdmin build old enough to predate
+        // the /api/login SSO handoff (or its CSRF exemption), so it rejects this request for
+        // reasons unrelated to the password. Fall back to the normal login page instead of a
+        // dead end, same as the no-SSO-yet path for OpenPanel above.
+        setScreen({ name: 'webview', server, url: `${server.baseUrl}/login` });
+        return;
+      }
       setScreen({ name: 'webview', server, url: `${server.baseUrl}${loginPath}` });
     } catch (err: any) {
       Alert.alert('Could not connect', err?.message || String(err));
