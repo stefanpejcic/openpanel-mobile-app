@@ -14,6 +14,9 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import * as SecureStore from 'expo-secure-store';
+import { File, Paths } from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
+import * as DocumentPicker from 'expo-document-picker';
 import { WebView } from 'react-native-webview';
 
 const logoMark = require('./assets/logo-mark.png');
@@ -52,6 +55,67 @@ async function loadServers(): Promise<ServerMeta[]> {
 
 async function saveServers(servers: ServerMeta[]) {
   await SecureStore.setItemAsync(SERVERS_KEY, JSON.stringify(servers));
+}
+
+const BACKUP_VERSION = 1;
+
+// Passwords travel in plain text inside this file, same as SecureStore holds them
+// on-device -- fine for a user-controlled backup, but callers must warn before sharing.
+type BackupPayload = {
+  version: number;
+  exportedAt: string;
+  servers: (ServerMeta & { password: string })[];
+};
+
+async function exportServers(servers: ServerMeta[]): Promise<void> {
+  const withPasswords = await Promise.all(
+    servers.map(async (s) => ({ ...s, password: (await SecureStore.getItemAsync(pwKey(s.id))) ?? '' }))
+  );
+  const payload: BackupPayload = {
+    version: BACKUP_VERSION,
+    exportedAt: new Date().toISOString(),
+    servers: withPasswords,
+  };
+  const file = new File(Paths.cache, `openpanel-servers-${Date.now()}.json`);
+  file.write(JSON.stringify(payload, null, 2));
+  if (!(await Sharing.isAvailableAsync())) {
+    throw new Error('Sharing is not available on this device.');
+  }
+  await Sharing.shareAsync(file.uri, { mimeType: 'application/json', dialogTitle: 'Export servers' });
+}
+
+// Merges by (panel, baseUrl, username) so re-importing the same backup, or one that
+// overlaps with servers already on this device, doesn't create duplicate entries.
+async function importServers(existing: ServerMeta[]): Promise<{ servers: ServerMeta[]; added: number }> {
+  const picked = await DocumentPicker.getDocumentAsync({ type: 'application/json', copyToCacheDirectory: true });
+  if (picked.canceled) return { servers: existing, added: 0 };
+
+  const raw = await new File(picked.assets[0].uri).text();
+  let payload: BackupPayload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    throw new Error('That file is not valid JSON.');
+  }
+  if (!Array.isArray(payload?.servers)) {
+    throw new Error('That file does not look like an OpenPanel server backup.');
+  }
+
+  const seen = new Set(existing.map((s) => `${s.panel}:${s.baseUrl}:${s.username}`));
+  const next = [...existing];
+  let added = 0;
+  for (const [i, s] of payload.servers.entries()) {
+    if (!s?.baseUrl || !s?.username || (s.panel !== 'openpanel' && s.panel !== 'openadmin')) continue;
+    const key = `${s.panel}:${s.baseUrl}:${s.username}`;
+    if (seen.has(key)) continue;
+    const id = `${Date.now()}_${i}`;
+    next.push({ id, name: s.name || s.baseUrl, baseUrl: s.baseUrl, username: s.username, panel: s.panel });
+    await SecureStore.setItemAsync(pwKey(id), s.password || '');
+    seen.add(key);
+    added++;
+  }
+  await saveServers(next);
+  return { servers: next, added };
 }
 
 type ServerStatus = 'checking' | 'online' | 'offline';
@@ -111,6 +175,7 @@ async function testOpenPanelConnection(baseUrl: string, username: string, passwo
 type Screen =
   | { name: 'list' }
   | { name: 'add' }
+  | { name: 'backup' }
   | { name: 'connecting'; server: ServerMeta }
   | { name: 'webview'; server: ServerMeta; url: string };
 
@@ -203,10 +268,25 @@ export default function App() {
     }
   }, []);
 
+  const handleExport = useCallback(async () => {
+    await exportServers(servers);
+  }, [servers]);
+
+  const handleImport = useCallback(async () => {
+    const { servers: next, added } = await importServers(servers);
+    setServers(next);
+    if (added > 0) refreshStatuses(next.slice(next.length - added));
+    return added;
+  }, [servers, refreshStatuses]);
+
   let content: React.ReactNode;
 
   if (screen.name === 'add') {
     content = <AddServerScreen onCancel={() => setScreen({ name: 'list' })} onSave={handleAddServer} />;
+  } else if (screen.name === 'backup') {
+    content = (
+      <BackupScreen onBack={() => setScreen({ name: 'list' })} onExport={handleExport} onImport={handleImport} />
+    );
   } else if (screen.name === 'connecting') {
     content = (
       <SafeAreaView style={styles.centerScreen}>
@@ -253,6 +333,7 @@ export default function App() {
         onConnect={handleConnect}
         onDelete={handleDeleteServer}
         onAdd={() => setScreen({ name: 'add' })}
+        onBackup={() => setScreen({ name: 'backup' })}
       />
     );
   }
@@ -272,12 +353,14 @@ function ServerListScreen({
   onConnect,
   onDelete,
   onAdd,
+  onBackup,
 }: {
   servers: ServerMeta[];
   statuses: Record<string, ServerStatus>;
   onConnect: (s: ServerMeta) => void;
   onDelete: (id: string) => void;
   onAdd: () => void;
+  onBackup: () => void;
 }) {
   return (
     <SafeAreaView style={styles.screen}>
@@ -285,6 +368,14 @@ function ServerListScreen({
       <View style={styles.headerRow}>
         <Image source={logoMark} style={styles.headerLogo} resizeMode="contain" />
         <Text style={styles.header}>OpenPanel</Text>
+        <View style={{ flex: 1 }} />
+        <TouchableOpacity
+          onPress={onBackup}
+          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          accessibilityLabel="Backup and restore servers"
+        >
+          <Text style={styles.headerBackupIcon}>💾</Text>
+        </TouchableOpacity>
       </View>
       <FlatList
         data={servers}
@@ -484,12 +575,95 @@ function AddServerScreen({
   );
 }
 
+function BackupScreen({
+  onBack,
+  onExport,
+  onImport,
+}: {
+  onBack: () => void;
+  onExport: () => Promise<void>;
+  onImport: () => Promise<number>;
+}) {
+  const [busy, setBusy] = useState<'export' | 'import' | null>(null);
+
+  const handleExportPress = () => {
+    Alert.alert(
+      'Export servers',
+      'The exported file will contain your saved server addresses, usernames, and passwords in plain text. Keep it somewhere safe, and only share it over a trusted channel.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Export',
+          onPress: async () => {
+            setBusy('export');
+            try {
+              await onExport();
+            } catch (err: any) {
+              Alert.alert('Could not export servers', err?.message || String(err));
+            } finally {
+              setBusy(null);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleImportPress = async () => {
+    setBusy('import');
+    try {
+      const added = await onImport();
+      Alert.alert(
+        'Import complete',
+        added > 0 ? `Added ${added} server${added === 1 ? '' : 's'}.` : 'No new servers found in that file.'
+      );
+    } catch (err: any) {
+      Alert.alert('Could not import servers', err?.message || String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <SafeAreaView style={styles.screen}>
+      <Text style={styles.header}>Backup & restore</Text>
+      <View style={styles.form}>
+        <Text style={styles.mutedText}>
+          Export your saved servers and passwords to a file you can keep as a backup or move to another
+          device, or import a file exported from this app before.
+        </Text>
+
+        <TouchableOpacity
+          style={[styles.primaryButton, busy !== null && styles.primaryButtonDisabled]}
+          disabled={busy !== null}
+          onPress={handleExportPress}
+        >
+          <Text style={styles.primaryButtonText}>{busy === 'export' ? 'Exporting…' : 'Export servers'}</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.primaryButton, busy !== null && styles.primaryButtonDisabled]}
+          disabled={busy !== null}
+          onPress={handleImportPress}
+        >
+          <Text style={styles.primaryButtonText}>{busy === 'import' ? 'Importing…' : 'Import servers'}</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.secondaryButton} onPress={onBack} disabled={busy !== null}>
+          <Text style={styles.secondaryButtonText}>Back</Text>
+        </TouchableOpacity>
+      </View>
+    </SafeAreaView>
+  );
+}
+
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: '#fff', paddingHorizontal: 20, paddingTop: 12 },
   centerScreen: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#fff' },
   headerRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 16 },
   headerLogo: { width: 30, height: 30, marginRight: 10 },
   header: { fontSize: 28, fontWeight: '700' },
+  headerBackupIcon: { fontSize: 24 },
   mutedText: { color: '#666', marginTop: 12, textAlign: 'center' },
   listContent: { paddingBottom: 12 },
   serverRow: {
