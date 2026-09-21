@@ -4,6 +4,7 @@
   "author": "OpenPanel, LLC",
   "main": "index.ts",
   "dependencies": {
+    "crypto-js": "^4.2.0",
     "expo": "~57.0.23",
     "expo-document-picker": "~57.0.2",
     "expo-file-system": "~57.0.7",
@@ -16,6 +17,7 @@
     "react-native-webview": "13.16.1"
   },
   "devDependencies": {
+    "@types/crypto-js": "^4.2.2",
     "@types/react": "~19.2.2",
     "eas-cli": "^24.7.0",
     "typescript": "~6.0.3"

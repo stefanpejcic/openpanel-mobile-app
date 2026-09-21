@@ -17,6 +17,7 @@ import * as SecureStore from 'expo-secure-store';
 import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
+import CryptoJS from 'crypto-js';
 import { WebView } from 'react-native-webview';
 
 const logoMark = require('./assets/logo-mark.png');
@@ -57,17 +58,24 @@ async function saveServers(servers: ServerMeta[]) {
   await SecureStore.setItemAsync(SERVERS_KEY, JSON.stringify(servers));
 }
 
-const BACKUP_VERSION = 1;
+const BACKUP_VERSION = 2;
 
-// Passwords travel in plain text inside this file, same as SecureStore holds them
-// on-device -- fine for a user-controlled backup, but callers must warn before sharing.
 type BackupPayload = {
   version: number;
   exportedAt: string;
   servers: (ServerMeta & { password: string })[];
 };
 
-async function exportServers(servers: ServerMeta[]): Promise<void> {
+// The backup file on disk is just { version, exportedAt, encrypted: <AES ciphertext string> } --
+// CryptoJS.AES.encrypt/decrypt with a passphrase handle salting and key derivation themselves
+// (OpenSSL-compatible EVP_BytesToKey), so there's no separate salt/IV bookkeeping here.
+type EncryptedBackupFile = {
+  version: number;
+  exportedAt: string;
+  encrypted: string;
+};
+
+async function exportServers(servers: ServerMeta[], password: string): Promise<void> {
   const withPasswords = await Promise.all(
     servers.map(async (s) => ({ ...s, password: (await SecureStore.getItemAsync(pwKey(s.id))) ?? '' }))
   );
@@ -76,26 +84,54 @@ async function exportServers(servers: ServerMeta[]): Promise<void> {
     exportedAt: new Date().toISOString(),
     servers: withPasswords,
   };
-  const file = new File(Paths.cache, `openpanel-servers-${Date.now()}.json`);
-  file.write(JSON.stringify(payload, null, 2));
+  const file: EncryptedBackupFile = {
+    version: BACKUP_VERSION,
+    exportedAt: payload.exportedAt,
+    encrypted: CryptoJS.AES.encrypt(JSON.stringify(payload), password).toString(),
+  };
+  const out = new File(Paths.cache, `openpanel-servers-${Date.now()}.json`);
+  out.write(JSON.stringify(file));
   if (!(await Sharing.isAvailableAsync())) {
     throw new Error('Sharing is not available on this device.');
   }
-  await Sharing.shareAsync(file.uri, { mimeType: 'application/json', dialogTitle: 'Export servers' });
+  await Sharing.shareAsync(out.uri, { mimeType: 'application/json', dialogTitle: 'Export servers' });
 }
 
 // Merges by (panel, baseUrl, username) so re-importing the same backup, or one that
 // overlaps with servers already on this device, doesn't create duplicate entries.
-async function importServers(existing: ServerMeta[]): Promise<{ servers: ServerMeta[]; added: number }> {
+async function importServers(
+  existing: ServerMeta[],
+  password: string
+): Promise<{ servers: ServerMeta[]; added: number }> {
   const picked = await DocumentPicker.getDocumentAsync({ type: 'application/json', copyToCacheDirectory: true });
   if (picked.canceled) return { servers: existing, added: 0 };
 
   const raw = await new File(picked.assets[0].uri).text();
-  let payload: BackupPayload;
+  let file: EncryptedBackupFile;
   try {
-    payload = JSON.parse(raw);
+    file = JSON.parse(raw);
   } catch {
     throw new Error('That file is not valid JSON.');
+  }
+  if (typeof file?.encrypted !== 'string') {
+    throw new Error('That file does not look like an OpenPanel server backup.');
+  }
+
+  let decrypted: string;
+  try {
+    decrypted = CryptoJS.AES.decrypt(file.encrypted, password).toString(CryptoJS.enc.Utf8);
+  } catch {
+    decrypted = '';
+  }
+  if (!decrypted) {
+    throw new Error('Wrong password, or the file is corrupted.');
+  }
+
+  let payload: BackupPayload;
+  try {
+    payload = JSON.parse(decrypted);
+  } catch {
+    throw new Error('Wrong password, or the file is corrupted.');
   }
   if (!Array.isArray(payload?.servers)) {
     throw new Error('That file does not look like an OpenPanel server backup.');
@@ -175,6 +211,7 @@ async function testOpenPanelConnection(baseUrl: string, username: string, passwo
 type Screen =
   | { name: 'list' }
   | { name: 'add' }
+  | { name: 'edit'; server: ServerMeta; password: string }
   | { name: 'backup' }
   | { name: 'connecting'; server: ServerMeta }
   | { name: 'webview'; server: ServerMeta; url: string };
@@ -213,6 +250,35 @@ export default function App() {
       const id = `${Date.now()}`;
       const entry: ServerMeta = { id, name, baseUrl, username, panel };
       const next = [...servers, entry];
+      await saveServers(next);
+      await SecureStore.setItemAsync(pwKey(id), password);
+      setServers(next);
+      setScreen({ name: 'list' });
+      refreshStatuses([entry]);
+    },
+    [servers]
+  );
+
+  const handleEditPress = useCallback(async (server: ServerMeta) => {
+    const password = (await SecureStore.getItemAsync(pwKey(server.id))) ?? '';
+    setScreen({ name: 'edit', server, password });
+  }, []);
+
+  const handleEditServer = useCallback(
+    async (
+      id: string,
+      name: string,
+      rawBaseUrl: string,
+      username: string,
+      password: string,
+      panel: PanelType
+    ) => {
+      const baseUrl = normalizeBaseUrl(rawBaseUrl);
+      if (panel === 'openpanel') {
+        await testOpenPanelConnection(baseUrl, username, password);
+      }
+      const entry: ServerMeta = { id, name, baseUrl, username, panel };
+      const next = servers.map((s) => (s.id === id ? entry : s));
       await saveServers(next);
       await SecureStore.setItemAsync(pwKey(id), password);
       setServers(next);
@@ -268,21 +334,42 @@ export default function App() {
     }
   }, []);
 
-  const handleExport = useCallback(async () => {
-    await exportServers(servers);
-  }, [servers]);
+  const handleExport = useCallback(
+    async (password: string) => {
+      await exportServers(servers, password);
+    },
+    [servers]
+  );
 
-  const handleImport = useCallback(async () => {
-    const { servers: next, added } = await importServers(servers);
-    setServers(next);
-    if (added > 0) refreshStatuses(next.slice(next.length - added));
-    return added;
-  }, [servers, refreshStatuses]);
+  const handleImport = useCallback(
+    async (password: string) => {
+      const { servers: next, added } = await importServers(servers, password);
+      setServers(next);
+      if (added > 0) refreshStatuses(next.slice(next.length - added));
+      return added;
+    },
+    [servers, refreshStatuses]
+  );
 
   let content: React.ReactNode;
 
   if (screen.name === 'add') {
     content = <AddServerScreen onCancel={() => setScreen({ name: 'list' })} onSave={handleAddServer} />;
+  } else if (screen.name === 'edit') {
+    content = (
+      <AddServerScreen
+        mode="edit"
+        initialName={screen.server.name}
+        initialBaseUrl={screen.server.baseUrl}
+        initialUsername={screen.server.username}
+        initialPassword={screen.password}
+        initialPanel={screen.server.panel}
+        onCancel={() => setScreen({ name: 'list' })}
+        onSave={(name, baseUrl, username, password, panel) =>
+          handleEditServer(screen.server.id, name, baseUrl, username, password, panel)
+        }
+      />
+    );
   } else if (screen.name === 'backup') {
     content = (
       <BackupScreen onBack={() => setScreen({ name: 'list' })} onExport={handleExport} onImport={handleImport} />
@@ -332,6 +419,7 @@ export default function App() {
         statuses={statuses}
         onConnect={handleConnect}
         onDelete={handleDeleteServer}
+        onEdit={handleEditPress}
         onAdd={() => setScreen({ name: 'add' })}
         onBackup={() => setScreen({ name: 'backup' })}
       />
@@ -352,6 +440,7 @@ function ServerListScreen({
   statuses,
   onConnect,
   onDelete,
+  onEdit,
   onAdd,
   onBackup,
 }: {
@@ -359,6 +448,7 @@ function ServerListScreen({
   statuses: Record<string, ServerStatus>;
   onConnect: (s: ServerMeta) => void;
   onDelete: (id: string) => void;
+  onEdit: (s: ServerMeta) => void;
   onAdd: () => void;
   onBackup: () => void;
 }) {
@@ -396,17 +486,25 @@ function ServerListScreen({
                 {item.panel === 'openpanel' ? 'OpenPanel account' : 'OpenAdmin server'}
               </Text>
             </View>
-            <TouchableOpacity
-              onPress={() =>
-                Alert.alert('Remove server', `Remove ${item.name}?`, [
-                  { text: 'Cancel', style: 'cancel' },
-                  { text: 'Remove', style: 'destructive', onPress: () => onDelete(item.id) },
-                ])
-              }
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-            >
-              <Text style={styles.deleteText}>Remove</Text>
-            </TouchableOpacity>
+            <View style={styles.rowActions}>
+              <TouchableOpacity
+                onPress={() => onEdit(item)}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <Text style={styles.editText}>Edit</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() =>
+                  Alert.alert('Remove server', `Remove ${item.name}?`, [
+                    { text: 'Cancel', style: 'cancel' },
+                    { text: 'Remove', style: 'destructive', onPress: () => onDelete(item.id) },
+                  ])
+                }
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <Text style={styles.deleteText}>Remove</Text>
+              </TouchableOpacity>
+            </View>
           </TouchableOpacity>
         )}
       />
@@ -444,9 +542,21 @@ function PanelTypeOption({
 }
 
 function AddServerScreen({
+  mode = 'add',
+  initialName,
+  initialBaseUrl,
+  initialUsername,
+  initialPassword,
+  initialPanel,
   onCancel,
   onSave,
 }: {
+  mode?: 'add' | 'edit';
+  initialName?: string;
+  initialBaseUrl?: string;
+  initialUsername?: string;
+  initialPassword?: string;
+  initialPanel?: PanelType;
   onCancel: () => void;
   onSave: (
     name: string,
@@ -456,14 +566,16 @@ function AddServerScreen({
     panel: PanelType
   ) => Promise<void>;
 }) {
-  const [name, setName] = useState('');
-  const [baseUrl, setBaseUrl] = useState('');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
+  const [name, setName] = useState(initialName ?? '');
+  const [baseUrl, setBaseUrl] = useState(initialBaseUrl ?? '');
+  const [username, setUsername] = useState(initialUsername ?? '');
+  const [password, setPassword] = useState(initialPassword ?? '');
   const [showPassword, setShowPassword] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [panel, setPanel] = useState<PanelType>('openpanel');
-  const [panelTouched, setPanelTouched] = useState(false);
+  const [panel, setPanel] = useState<PanelType>(initialPanel ?? 'openpanel');
+  // When editing, the panel type is already known -- don't let the auto-pick
+  // effect below flip it just because the user is tweaking the URL.
+  const [panelTouched, setPanelTouched] = useState(mode === 'edit');
 
   // Auto-pick the panel type from the port the user typed (2083 -> OpenPanel,
   // 2087 -> OpenAdmin's default), unless they've already picked one themselves.
@@ -482,7 +594,7 @@ function AddServerScreen({
 
   return (
     <SafeAreaView style={styles.screen}>
-      <Text style={styles.header}>Add server</Text>
+      <Text style={styles.header}>{mode === 'edit' ? 'Edit server' : 'Add server'}</Text>
       <View style={styles.form}>
         <Text style={styles.label}>Type</Text>
         <View style={styles.panelPickerRow}>
@@ -557,14 +669,20 @@ function AddServerScreen({
             try {
               await onSave(name.trim(), baseUrl, username.trim(), password, panel);
             } catch (err: any) {
-              Alert.alert('Could not add server', err?.message || String(err));
+              Alert.alert(mode === 'edit' ? 'Could not save changes' : 'Could not add server', err?.message || String(err));
             } finally {
               setSaving(false);
             }
           }}
         >
           <Text style={styles.primaryButtonText}>
-            {saving ? (panel === 'openpanel' ? 'Testing connection…' : 'Saving…') : 'Save'}
+            {saving
+              ? panel === 'openpanel'
+                ? 'Testing connection…'
+                : 'Saving…'
+              : mode === 'edit'
+                ? 'Save changes'
+                : 'Save'}
           </Text>
         </TouchableOpacity>
         <TouchableOpacity style={styles.secondaryButton} onPress={onCancel}>
@@ -581,15 +699,19 @@ function BackupScreen({
   onImport,
 }: {
   onBack: () => void;
-  onExport: () => Promise<void>;
-  onImport: () => Promise<number>;
+  onExport: (password: string) => Promise<void>;
+  onImport: (password: string) => Promise<number>;
 }) {
   const [busy, setBusy] = useState<'export' | 'import' | null>(null);
+  const [exportPassword, setExportPassword] = useState('');
+  const [showExportPassword, setShowExportPassword] = useState(false);
+  const [importPassword, setImportPassword] = useState('');
+  const [showImportPassword, setShowImportPassword] = useState(false);
 
   const handleExportPress = () => {
     Alert.alert(
       'Export servers',
-      'The exported file will contain your saved server addresses, usernames, and passwords in plain text. Keep it somewhere safe, and only share it over a trusted channel.',
+      'The file will be encrypted with the password below. Keep the password somewhere safe -- without it, the backup can\'t be restored.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -597,7 +719,8 @@ function BackupScreen({
           onPress: async () => {
             setBusy('export');
             try {
-              await onExport();
+              await onExport(exportPassword);
+              setExportPassword('');
             } catch (err: any) {
               Alert.alert('Could not export servers', err?.message || String(err));
             } finally {
@@ -612,7 +735,8 @@ function BackupScreen({
   const handleImportPress = async () => {
     setBusy('import');
     try {
-      const added = await onImport();
+      const added = await onImport(importPassword);
+      setImportPassword('');
       Alert.alert(
         'Import complete',
         added > 0 ? `Added ${added} server${added === 1 ? '' : 's'}.` : 'No new servers found in that file.'
@@ -628,22 +752,64 @@ function BackupScreen({
     <SafeAreaView style={styles.screen}>
       <Text style={styles.header}>Backup & restore</Text>
       <View style={styles.form}>
+        <Text style={styles.label}>Export</Text>
         <Text style={styles.mutedText}>
-          Export your saved servers and passwords to a file you can keep as a backup or move to another
-          device, or import a file exported from this app before.
+          Set a password to encrypt your saved servers and their logins into a file you can keep as a backup
+          or move to another device.
         </Text>
-
+        <View style={styles.passwordRow}>
+          <TextInput
+            style={[styles.input, styles.passwordInput]}
+            value={exportPassword}
+            onChangeText={setExportPassword}
+            placeholder="Password to encrypt with"
+            placeholderTextColor="#999"
+            secureTextEntry={!showExportPassword}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+          <TouchableOpacity
+            style={styles.passwordToggle}
+            onPress={() => setShowExportPassword((v) => !v)}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          >
+            <Text style={styles.passwordToggleText}>{showExportPassword ? 'Hide' : 'Show'}</Text>
+          </TouchableOpacity>
+        </View>
         <TouchableOpacity
-          style={[styles.primaryButton, busy !== null && styles.primaryButtonDisabled]}
-          disabled={busy !== null}
+          style={[styles.primaryButton, (busy !== null || !exportPassword) && styles.primaryButtonDisabled]}
+          disabled={busy !== null || !exportPassword}
           onPress={handleExportPress}
         >
           <Text style={styles.primaryButtonText}>{busy === 'export' ? 'Exporting…' : 'Export servers'}</Text>
         </TouchableOpacity>
 
+        <Text style={[styles.label, { marginTop: 28 }]}>Import</Text>
+        <Text style={styles.mutedText}>
+          Pick a file exported from this app before, and enter the password it was encrypted with.
+        </Text>
+        <View style={styles.passwordRow}>
+          <TextInput
+            style={[styles.input, styles.passwordInput]}
+            value={importPassword}
+            onChangeText={setImportPassword}
+            placeholder="Password it was encrypted with"
+            placeholderTextColor="#999"
+            secureTextEntry={!showImportPassword}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+          <TouchableOpacity
+            style={styles.passwordToggle}
+            onPress={() => setShowImportPassword((v) => !v)}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          >
+            <Text style={styles.passwordToggleText}>{showImportPassword ? 'Hide' : 'Show'}</Text>
+          </TouchableOpacity>
+        </View>
         <TouchableOpacity
-          style={[styles.primaryButton, busy !== null && styles.primaryButtonDisabled]}
-          disabled={busy !== null}
+          style={[styles.primaryButton, (busy !== null || !importPassword) && styles.primaryButtonDisabled]}
+          disabled={busy !== null || !importPassword}
           onPress={handleImportPress}
         >
           <Text style={styles.primaryButtonText}>{busy === 'import' ? 'Importing…' : 'Import servers'}</Text>
@@ -677,6 +843,8 @@ const styles = StyleSheet.create({
   serverName: { fontSize: 17, fontWeight: '600' },
   serverSub: { fontSize: 13, color: '#777', marginTop: 2 },
   serverPanelLabel: { fontSize: 11, color: '#aaa', marginTop: 2 },
+  rowActions: { alignItems: 'flex-end', gap: 8 },
+  editText: { color: '#007aff', fontSize: 13 },
   deleteText: { color: '#c0392b', fontSize: 13 },
   primaryButton: {
     backgroundColor: '#111',
