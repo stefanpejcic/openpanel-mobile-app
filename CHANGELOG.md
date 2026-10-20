@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1
+
+- Fixed: connecting to an OpenAdmin server with API access disabled now says so, with where to enable it (OpenAdmin > Settings > API Access), instead of opening the login page.
+
 ## 1.1.0
 
 - Added backup & restore: export saved servers and their logins to a password-encrypted file (via the share sheet), and import a previously exported file (with its password) to restore them or move them to another device. Accessible from the icon in the top-right of the server list.

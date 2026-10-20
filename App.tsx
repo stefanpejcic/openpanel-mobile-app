@@ -318,6 +318,13 @@ export default function App() {
         // A genuine credential/account problem -- surface it instead of silently falling back.
         throw new Error(body?.error || `Login failed (HTTP ${res.status})`);
       }
+      if (res.status === 404 && /API access is disabled/i.test(body?.error || '')) {
+        // The app signs in through the OpenAdmin API, so say what to turn on instead of
+        // dropping the user on a login form they can't get past from here.
+        throw new Error(
+          'API access is disabled on this OpenAdmin server. Enable it in OpenAdmin > Settings > API Access, then try again.'
+        );
+      }
       const loginPath = res.ok ? body?.login_path : undefined;
       if (!loginPath) {
         // Quick-login isn't available -- most likely an OpenAdmin build old enough to predate
