@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
   StatusBar,
   Platform,
+  BackHandler,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import * as SecureStore from 'expo-secure-store';
@@ -220,6 +221,22 @@ export default function App() {
   const [servers, setServers] = useState<ServerMeta[]>([]);
   const [statuses, setStatuses] = useState<Record<string, ServerStatus>>({});
   const [screen, setScreen] = useState<Screen>({ name: 'list' });
+  // URLs of pages the panel opened as new windows (target="_blank" / window.open), e.g.
+  // OpenAdmin's "Impersonate" link to the user panel. Without onOpenWindow, react-native-webview
+  // hands these to the system browser, which has no session cookie -- so they're stacked as
+  // in-app tabs over the main WebView instead (cookies are shared, so autologin just works).
+  const [tabs, setTabs] = useState<string[]>([]);
+  const openTab = useCallback((url: string) => setTabs((prev) => [...prev, url]), []);
+  const closeTab = useCallback(() => setTabs((prev) => prev.slice(0, -1)), []);
+
+  useEffect(() => {
+    if (screen.name !== 'webview' || tabs.length === 0) return;
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      closeTab();
+      return true;
+    });
+    return () => sub.remove();
+  }, [screen.name, tabs.length, closeTab]);
 
   const refreshStatuses = useCallback((list: ServerMeta[]) => {
     setStatuses((prev) => {
@@ -389,34 +406,51 @@ export default function App() {
       </SafeAreaView>
     );
   } else if (screen.name === 'webview') {
+    const renderWebView = (url: string) => (
+      <WebView
+        source={{ uri: url }}
+        style={styles.webview}
+        sharedCookiesEnabled
+        startInLoadingState
+        onOpenWindow={(e) => openTab(e.nativeEvent.targetUrl)}
+        renderLoading={() => (
+          <View style={styles.webviewLoading}>
+            <ActivityIndicator size="large" />
+          </View>
+        )}
+      />
+    );
     content = (
       <SafeAreaView style={styles.webviewSafeArea} edges={['top', 'bottom', 'left', 'right']}>
         <View style={styles.webviewHeader}>
           <TouchableOpacity
             onPress={() => {
+              if (tabs.length > 0) {
+                closeTab();
+                return;
+              }
               setScreen({ name: 'list' });
               refreshStatuses(servers);
             }}
             style={styles.webviewCloseBtn}
           >
-            <Text style={styles.webviewCloseText}>‹ Servers</Text>
+            <Text style={styles.webviewCloseText}>{tabs.length > 0 ? '‹ Back' : '‹ Servers'}</Text>
           </TouchableOpacity>
           <Text style={styles.webviewTitle} numberOfLines={1}>
             {screen.server.name}
           </Text>
           <View style={styles.webviewCloseBtn} />
         </View>
-        <WebView
-          source={{ uri: screen.url }}
-          style={styles.webview}
-          sharedCookiesEnabled
-          startInLoadingState
-          renderLoading={() => (
-            <View style={styles.webviewLoading}>
-              <ActivityIndicator size="large" />
+        <View style={styles.webview}>
+          {renderWebView(screen.url)}
+          {/* tabs sit on top of the main WebView rather than replacing it, so closing one
+              returns to the panel page exactly as it was left */}
+          {tabs.map((url, i) => (
+            <View key={i} style={styles.webviewTab}>
+              {renderWebView(url)}
             </View>
-          )}
-        />
+          ))}
+        </View>
       </SafeAreaView>
     );
   } else {
@@ -905,6 +939,7 @@ const styles = StyleSheet.create({
   webviewCloseText: { fontSize: 16, color: '#007aff' },
   webviewTitle: { flex: 1, textAlign: 'center', fontSize: 16, fontWeight: '600' },
   webview: { flex: 1 },
+  webviewTab: { ...StyleSheet.absoluteFill, backgroundColor: '#fff' },
   webviewLoading: {
     ...StyleSheet.absoluteFill,
     alignItems: 'center',
